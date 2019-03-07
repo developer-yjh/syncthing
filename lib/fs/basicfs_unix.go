@@ -8,7 +8,12 @@
 
 package fs
 
-import "os"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 func (BasicFilesystem) SymlinksSupported() bool {
 	return true
@@ -30,12 +35,8 @@ func (f *BasicFilesystem) ReadSymlink(name string) (string, error) {
 	return os.Readlink(name)
 }
 
-func (f *BasicFilesystem) MkdirAll(name string, perm FileMode) error {
-	name, err := f.rooted(name)
-	if err != nil {
-		return err
-	}
-	return os.MkdirAll(name, os.FileMode(perm))
+func (f *BasicFilesystem) mkdirAll(path string, perm os.FileMode) error {
+	return os.MkdirAll(path, perm)
 }
 
 // Unhide is a noop on unix, as unhiding files requires renaming them.
@@ -55,3 +56,23 @@ func (f *BasicFilesystem) Hide(name string) error {
 func (f *BasicFilesystem) Roots() ([]string, error) {
 	return []string{"/"}, nil
 }
+
+// unrootedChecked returns the path relative to the folder root (same as
+// unrooted). It panics if the given path is not a subpath and handles the
+// special case when the given path is the folder root without a trailing
+// pathseparator.
+func (f *BasicFilesystem) unrootedChecked(absPath, root string) string {
+	if absPath+string(PathSeparator) == root {
+		return "."
+	}
+	if !strings.HasPrefix(absPath, root) {
+		panic(fmt.Sprintf("bug: Notify backend is processing a change outside of the filesystem root: f.root==%v, root==%v, path==%v", f.root, root, absPath))
+	}
+	return rel(absPath, root)
+}
+
+func rel(path, prefix string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(path, prefix), string(PathSeparator))
+}
+
+var evalSymlinks = filepath.EvalSymlinks

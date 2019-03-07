@@ -7,6 +7,7 @@
 package fs
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -43,9 +44,9 @@ func (fs *logFilesystem) Create(name string) (File, error) {
 	return file, err
 }
 
-func (fs *logFilesystem) CreateSymlink(name, target string) error {
-	err := fs.Filesystem.CreateSymlink(name, target)
-	l.Debugln(getCaller(), fs.Type(), fs.URI(), "CreateSymlink", name, target, err)
+func (fs *logFilesystem) CreateSymlink(target, name string) error {
+	err := fs.Filesystem.CreateSymlink(target, name)
+	l.Debugln(getCaller(), fs.Type(), fs.URI(), "CreateSymlink", target, name, err)
 	return err
 }
 
@@ -125,6 +126,12 @@ func (fs *logFilesystem) Walk(root string, walkFn WalkFunc) error {
 	err := fs.Filesystem.Walk(root, walkFn)
 	l.Debugln(getCaller(), fs.Type(), fs.URI(), "Walk", root, walkFn, err)
 	return err
+}
+
+func (fs *logFilesystem) Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error) {
+	evChan, err := fs.Filesystem.Watch(path, ignore, ctx, ignorePerms)
+	l.Debugln(getCaller(), fs.Type(), fs.URI(), "Watch", path, ignore, ignorePerms, err)
+	return evChan, err
 }
 
 func (fs *logFilesystem) Unhide(name string) error {

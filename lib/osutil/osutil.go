@@ -10,7 +10,6 @@ package osutil
 import (
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -35,9 +34,9 @@ func TryRename(filesystem fs.Filesystem, from, to string) error {
 	})
 }
 
-// Rename moves a temporary file to it's final place.
+// Rename moves a temporary file to its final place.
 // Will make sure to delete the from file if the operation fails, so use only
-// for situations like committing a temp file to it's final location.
+// for situations like committing a temp file to its final location.
 // Tries hard to succeed on various systems by temporarily tweaking directory
 // permissions and removing the destination file when necessary.
 func Rename(filesystem fs.Filesystem, from, to string) error {
@@ -114,7 +113,7 @@ func withPreparedTarget(filesystem fs.Filesystem, from, to string, f func() erro
 
 // copyFileContents copies the contents of the file named src to the file named
 // by dst. The file will be created if it does not already exist. If the
-// destination file exists, all it's contents will be replaced by the contents
+// destination file exists, all its contents will be replaced by the contents
 // of the source file.
 func copyFileContents(filesystem fs.Filesystem, src, dst string) (err error) {
 	in, err := filesystem.Open(src)
@@ -136,20 +135,13 @@ func copyFileContents(filesystem fs.Filesystem, src, dst string) (err error) {
 	return
 }
 
-var execExts map[string]bool
-
-func init() {
-	// PATHEXT contains a list of executable file extensions, on Windows
-	pathext := filepath.SplitList(os.Getenv("PATHEXT"))
-	// We want the extensions in execExts to be lower case
-	execExts = make(map[string]bool, len(pathext))
-	for _, ext := range pathext {
-		execExts[strings.ToLower(ext)] = true
+func IsDeleted(ffs fs.Filesystem, name string) bool {
+	if _, err := ffs.Lstat(name); fs.IsNotExist(err) {
+		return true
 	}
-}
-
-// IsWindowsExecutable returns true if the given path has an extension that is
-// in the list of executable extensions.
-func IsWindowsExecutable(path string) bool {
-	return execExts[strings.ToLower(filepath.Ext(path))]
+	switch TraversesSymlink(ffs, filepath.Dir(name)).(type) {
+	case *NotADirectoryError, *TraversesSymlinkError:
+		return true
+	}
+	return false
 }

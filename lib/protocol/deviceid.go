@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/calmh/luhn"
 	"github.com/syncthing/syncthing/lib/sha256"
 )
 
@@ -20,9 +19,17 @@ type DeviceID [DeviceIDLength]byte
 type ShortID uint64
 
 var (
-	LocalDeviceID = DeviceID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-	EmptyDeviceID = DeviceID{ /* all zeroes */ }
+	LocalDeviceID  = repeatedDeviceID(0xff)
+	GlobalDeviceID = repeatedDeviceID(0xf8)
+	EmptyDeviceID  = DeviceID{ /* all zeroes */ }
 )
+
+func repeatedDeviceID(v byte) (d DeviceID) {
+	for i := range d {
+		d[i] = v
+	}
+	return
+}
 
 // NewDeviceID generates a new device ID from the raw bytes of a certificate
 func NewDeviceID(rawCert []byte) DeviceID {
@@ -158,7 +165,7 @@ func luhnify(s string) (string, error) {
 	for i := 0; i < 4; i++ {
 		p := s[i*13 : (i+1)*13]
 		copy(res[i*(13+1):], p)
-		l, err := luhn.Base32.Generate(p)
+		l, err := luhnBase32.generate(p)
 		if err != nil {
 			return "", err
 		}
@@ -176,7 +183,7 @@ func unluhnify(s string) (string, error) {
 	for i := 0; i < 4; i++ {
 		p := s[i*(13+1) : (i+1)*(13+1)-1]
 		copy(res[i*13:], p)
-		l, err := luhn.Base32.Generate(p)
+		l, err := luhnBase32.generate(p)
 		if err != nil {
 			return "", err
 		}

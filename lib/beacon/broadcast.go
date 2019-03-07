@@ -36,6 +36,7 @@ func NewBroadcast(port int) *Broadcast {
 			Log: func(line string) {
 				l.Debugln(line)
 			},
+			PassThroughPanics: true,
 		}),
 		port:   port,
 		inbox:  make(chan []byte),
@@ -137,17 +138,11 @@ func (w *broadcastWriter) Serve() {
 				return
 			}
 
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				// A transient error. Lets hope for better luck in the future.
-				l.Debugln(err)
-				continue
-			}
-
 			if err != nil {
-				// Some other error that we don't expect. Bail and retry.
+				// Some other error that we don't expect. Debug and continue.
 				l.Debugln(err)
 				w.setError(err)
-				return
+				continue
 			}
 
 			l.Debugf("sent %d bytes to %s", len(bs), dst)

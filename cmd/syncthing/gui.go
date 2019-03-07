@@ -7,15 +7,19 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"sort"
@@ -23,17 +27,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
+	metrics "github.com/rcrowley/go-metrics"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/logger"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/stats"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/upgrade"
@@ -43,6 +49,9 @@ import (
 
 var (
 	startTime = time.Now()
+
+	// matches a bcrypt hash and not too much else
+	bcryptExpr = regexp.MustCompile(`^\$2[aby]\$\d+\$.{50,}`)
 )
 
 const (
@@ -53,79 +62,33 @@ const (
 
 type apiService struct {
 	id                 protocol.DeviceID
-	cfg                configIntf
+	cfg                config.Wrapper
 	httpsCertFile      string
 	httpsKeyFile       string
 	statics            *staticsServer
-	model              modelIntf
+	model              model.Model
 	eventSubs          map[events.EventType]events.BufferedSubscription
 	eventSubsMut       sync.Mutex
 	discoverer         discover.CachingMux
-	connectionsService connectionsIntf
+	connectionsService connections.Service
 	fss                *folderSummaryService
 	systemConfigMut    sync.Mutex    // serializes posts to /rest/system/config
 	stop               chan struct{} // signals intentional stop
 	configChanged      chan struct{} // signals intentional listener close due to config change
 	started            chan string   // signals startup complete by sending the listener address, for testing only
-	startedOnce        chan struct{} // the service has started successfully at least once
+	startedOnce        chan struct{} // the service has started at least once
+	startupErr         error
 	cpu                rater
 
 	guiErrors logger.Recorder
 	systemLog logger.Recorder
 }
 
-type modelIntf interface {
-	GlobalDirectoryTree(folder, prefix string, levels int, dirsonly bool) map[string]interface{}
-	Completion(device protocol.DeviceID, folder string) model.FolderCompletion
-	Override(folder string)
-	NeedFolderFiles(folder string, page, perpage int) ([]db.FileInfoTruncated, []db.FileInfoTruncated, []db.FileInfoTruncated, int)
-	NeedSize(folder string) db.Counts
-	ConnectionStats() map[string]interface{}
-	DeviceStatistics() map[string]stats.DeviceStatistics
-	FolderStatistics() map[string]stats.FolderStatistics
-	CurrentFolderFile(folder string, file string) (protocol.FileInfo, bool)
-	CurrentGlobalFile(folder string, file string) (protocol.FileInfo, bool)
-	ResetFolder(folder string)
-	Availability(folder, file string, version protocol.Vector, block protocol.BlockInfo) []model.Availability
-	GetIgnores(folder string) ([]string, []string, error)
-	SetIgnores(folder string, content []string) error
-	DelayScan(folder string, next time.Duration)
-	ScanFolder(folder string) error
-	ScanFolders() map[string]error
-	ScanFolderSubdirs(folder string, subs []string) error
-	BringToFront(folder, file string)
-	ConnectedTo(deviceID protocol.DeviceID) bool
-	GlobalSize(folder string) db.Counts
-	LocalSize(folder string) db.Counts
-	CurrentSequence(folder string) (int64, bool)
-	RemoteSequence(folder string) (int64, bool)
-	State(folder string) (string, time.Time, error)
-}
-
-type configIntf interface {
-	GUI() config.GUIConfiguration
-	RawCopy() config.Configuration
-	Options() config.OptionsConfiguration
-	Replace(cfg config.Configuration) error
-	Subscribe(c config.Committer)
-	Folders() map[string]config.FolderConfiguration
-	Devices() map[protocol.DeviceID]config.DeviceConfiguration
-	SetDevice(config.DeviceConfiguration) error
-	SetDevices([]config.DeviceConfiguration) error
-	Save() error
-	ListenAddresses() []string
-	RequiresRestart() bool
-}
-
-type connectionsIntf interface {
-	Status() map[string]interface{}
-}
-
 type rater interface {
 	Rate() float64
 }
 
-func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKeyFile, assetDir string, m modelIntf, defaultSub, diskSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService connectionsIntf, errors, systemLog logger.Recorder, cpu rater) *apiService {
+func newAPIService(id protocol.DeviceID, cfg config.Wrapper, httpsCertFile, httpsKeyFile, assetDir string, m model.Model, defaultSub, diskSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService connections.Service, errors, systemLog logger.Recorder, cpu rater) *apiService {
 	service := &apiService{
 		id:            id,
 		cfg:           cfg,
@@ -152,6 +115,11 @@ func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKey
 	return service
 }
 
+func (s *apiService) WaitForStart() error {
+	<-s.startedOnce
+	return s.startupErr
+}
+
 func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, error) {
 	cert, err := tls.LoadX509KeyPair(s.httpsCertFile, s.httpsKeyFile)
 	if err != nil {
@@ -166,30 +134,21 @@ func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, 
 			name = tlsDefaultCommonName
 		}
 
-		cert, err = tlsutil.NewCertificate(s.httpsCertFile, s.httpsKeyFile, name, httpsRSABits)
+		cert, err = tlsutil.NewCertificate(s.httpsCertFile, s.httpsKeyFile, name)
 	}
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS10, // No SSLv3
-		CipherSuites: []uint16{
-			// No RC4
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
-			tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-		},
-	}
+	tlsCfg := tlsutil.SecureDefault()
+	tlsCfg.Certificates = []tls.Certificate{cert}
 
-	rawListener, err := net.Listen("tcp", guiCfg.Address())
+	if guiCfg.Network() == "unix" {
+		// When listening on a UNIX socket we should unlink before bind,
+		// lest we get a "bind: address already in use". We don't
+		// particularly care if this succeeds or not.
+		os.Remove(guiCfg.Address())
+	}
+	rawListener, err := net.Listen(guiCfg.Network(), guiCfg.Address())
 	if err != nil {
 		return nil, err
 	}
@@ -205,14 +164,14 @@ func sendJSON(w http.ResponseWriter, jsonObject interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	// Marshalling might fail, in which case we should return a 500 with the
 	// actual error.
-	bs, err := json.Marshal(jsonObject)
+	bs, err := json.MarshalIndent(jsonObject, "", "  ")
 	if err != nil {
 		// This Marshal() can't fail though.
 		bs, _ = json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(bs), http.StatusInternalServerError)
 		return
 	}
-	w.Write(bs)
+	fmt.Fprintf(w, "%s\n", bs)
 }
 
 func (s *apiService) Serve() {
@@ -223,14 +182,15 @@ func (s *apiService) Serve() {
 			// We let this be a loud user-visible warning as it may be the only
 			// indication they get that the GUI won't be available.
 			l.Warnln("Starting API/GUI:", err)
-			return
 
 		default:
 			// This is during initialization. A failure here should be fatal
 			// as there will be no way for the user to communicate with us
 			// otherwise anyway.
-			l.Fatalln("Starting API/GUI:", err)
+			s.startupErr = err
+			close(s.startedOnce)
 		}
+		return
 	}
 
 	if listener == nil {
@@ -247,8 +207,13 @@ func (s *apiService) Serve() {
 	getRestMux.HandleFunc("/rest/db/file", s.getDBFile)                          // folder file
 	getRestMux.HandleFunc("/rest/db/ignores", s.getDBIgnores)                    // folder
 	getRestMux.HandleFunc("/rest/db/need", s.getDBNeed)                          // folder [perpage] [page]
+	getRestMux.HandleFunc("/rest/db/remoteneed", s.getDBRemoteNeed)              // device folder [perpage] [page]
+	getRestMux.HandleFunc("/rest/db/localchanged", s.getDBLocalChanged)          // folder
 	getRestMux.HandleFunc("/rest/db/status", s.getDBStatus)                      // folder
 	getRestMux.HandleFunc("/rest/db/browse", s.getDBBrowse)                      // folder [prefix] [dirsonly] [levels]
+	getRestMux.HandleFunc("/rest/folder/versions", s.getFolderVersions)          // folder
+	getRestMux.HandleFunc("/rest/folder/errors", s.getFolderErrors)              // folder
+	getRestMux.HandleFunc("/rest/folder/pullerrors", s.getFolderErrors)          // folder (deprecated)
 	getRestMux.HandleFunc("/rest/events", s.getIndexEvents)                      // [since] [limit] [timeout] [events]
 	getRestMux.HandleFunc("/rest/events/disk", s.getDiskEvents)                  // [since] [limit] [timeout]
 	getRestMux.HandleFunc("/rest/stats/device", s.getDeviceStats)                // -
@@ -276,7 +241,9 @@ func (s *apiService) Serve() {
 	postRestMux.HandleFunc("/rest/db/prio", s.postDBPrio)                          // folder file [perpage] [page]
 	postRestMux.HandleFunc("/rest/db/ignores", s.postDBIgnores)                    // folder
 	postRestMux.HandleFunc("/rest/db/override", s.postDBOverride)                  // folder
+	postRestMux.HandleFunc("/rest/db/revert", s.postDBRevert)                      // folder
 	postRestMux.HandleFunc("/rest/db/scan", s.postDBScan)                          // folder [sub...] [delay]
+	postRestMux.HandleFunc("/rest/folder/versions", s.postFolderVersionsRestore)   // folder <body>
 	postRestMux.HandleFunc("/rest/system/config", s.postSystemConfig)              // <body>
 	postRestMux.HandleFunc("/rest/system/error", s.postSystemError)                // <body>
 	postRestMux.HandleFunc("/rest/system/error/clear", s.postSystemErrorClear)     // -
@@ -295,6 +262,7 @@ func (s *apiService) Serve() {
 	debugMux.HandleFunc("/rest/debug/httpmetrics", s.getSystemHTTPMetrics)
 	debugMux.HandleFunc("/rest/debug/cpuprof", s.getCPUProf) // duration
 	debugMux.HandleFunc("/rest/debug/heapprof", s.getHeapProf)
+	debugMux.HandleFunc("/rest/debug/support", s.getSupportBundle)
 	getRestMux.Handle("/rest/debug/", s.whenDebugging(debugMux))
 
 	// A handler that splits requests between the two above and disables
@@ -322,8 +290,8 @@ func (s *apiService) Serve() {
 	handler = withDetailsMiddleware(s.id, handler)
 
 	// Wrap everything in basic auth, if user/password is set.
-	if len(guiCfg.User) > 0 && len(guiCfg.Password) > 0 {
-		handler = basicAuthAndSessionMiddleware("sessionid-"+s.id.String()[:5], guiCfg, handler)
+	if guiCfg.IsAuthEnabled() {
+		handler = basicAuthAndSessionMiddleware("sessionid-"+s.id.String()[:5], guiCfg, s.cfg.LDAP(), handler)
 	}
 
 	// Redirect to HTTPS if we are supposed to
@@ -389,6 +357,19 @@ func (s *apiService) Serve() {
 	}
 }
 
+// Complete implements suture.IsCompletable, which signifies to the supervisor
+// whether to stop restarting the service.
+func (s *apiService) Complete() bool {
+	select {
+	case <-s.startedOnce:
+		return s.startupErr != nil
+	case <-s.stop:
+		return true
+	default:
+	}
+	return false
+}
+
 func (s *apiService) Stop() {
 	close(s.stop)
 }
@@ -398,6 +379,9 @@ func (s *apiService) String() string {
 }
 
 func (s *apiService) VerifyConfiguration(from, to config.Configuration) error {
+	if to.GUI.Network() != "tcp" {
+		return nil
+	}
 	_, err := net.ResolveTCPAddr("tcp", to.GUI.Address())
 	return err
 }
@@ -509,7 +493,6 @@ func corsMiddleware(next http.Handler, allowFrameLoading bool) http.Handler {
 
 		// For everything else, pass to the next handler
 		next.ServeHTTP(w, r)
-		return
 	})
 }
 
@@ -546,7 +529,7 @@ func noCacheMiddleware(h http.Handler) http.Handler {
 
 func withDetailsMiddleware(id protocol.DeviceID, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Syncthing-Version", Version)
+		w.Header().Set("X-Syncthing-Version", build.Version)
 		w.Header().Set("X-Syncthing-ID", id.String())
 		h.ServeHTTP(w, r)
 	})
@@ -570,7 +553,7 @@ func (s *apiService) whenDebugging(h http.Handler) http.Handler {
 			return
 		}
 
-		http.Error(w, "Debugging disabled", http.StatusBadRequest)
+		http.Error(w, "Debugging disabled", http.StatusForbidden)
 	})
 }
 
@@ -587,12 +570,15 @@ func (s *apiService) getJSMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiService) getSystemVersion(w http.ResponseWriter, r *http.Request) {
-	sendJSON(w, map[string]string{
-		"version":     Version,
-		"codename":    Codename,
-		"longVersion": LongVersion,
+	sendJSON(w, map[string]interface{}{
+		"version":     build.Version,
+		"codename":    build.Codename,
+		"longVersion": build.LongVersion,
 		"os":          runtime.GOOS,
 		"arch":        runtime.GOARCH,
+		"isBeta":      build.IsBeta,
+		"isCandidate": build.IsCandidate,
+		"isRelease":   build.IsRelease,
 	})
 }
 
@@ -650,38 +636,65 @@ func (s *apiService) getDBCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	comp := s.model.Completion(device, folder)
-	sendJSON(w, map[string]interface{}{
+	sendJSON(w, jsonCompletion(s.model.Completion(device, folder)))
+}
+
+func jsonCompletion(comp model.FolderCompletion) map[string]interface{} {
+	return map[string]interface{}{
 		"completion":  comp.CompletionPct,
 		"needBytes":   comp.NeedBytes,
+		"needItems":   comp.NeedItems,
 		"globalBytes": comp.GlobalBytes,
 		"needDeletes": comp.NeedDeletes,
-	})
+	}
 }
 
 func (s *apiService) getDBStatus(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
-	sendJSON(w, folderSummary(s.cfg, s.model, folder))
+	if sum, err := folderSummary(s.cfg, s.model, folder); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+	} else {
+		sendJSON(w, sum)
+	}
 }
 
-func folderSummary(cfg configIntf, m modelIntf, folder string) map[string]interface{} {
+func folderSummary(cfg config.Wrapper, m model.Model, folder string) (map[string]interface{}, error) {
 	var res = make(map[string]interface{})
+
+	errors, err := m.FolderErrors(folder)
+	if err != nil && err != model.ErrFolderPaused {
+		// Stats from the db can still be obtained if the folder is just paused
+		return nil, err
+	}
+	res["errors"] = len(errors)
+	res["pullErrors"] = len(errors) // deprecated
 
 	res["invalid"] = "" // Deprecated, retains external API for now
 
 	global := m.GlobalSize(folder)
-	res["globalFiles"], res["globalDirectories"], res["globalSymlinks"], res["globalDeleted"], res["globalBytes"] = global.Files, global.Directories, global.Symlinks, global.Deleted, global.Bytes
+	res["globalFiles"], res["globalDirectories"], res["globalSymlinks"], res["globalDeleted"], res["globalBytes"], res["globalTotalItems"] = global.Files, global.Directories, global.Symlinks, global.Deleted, global.Bytes, global.TotalItems()
 
 	local := m.LocalSize(folder)
-	res["localFiles"], res["localDirectories"], res["localSymlinks"], res["localDeleted"], res["localBytes"] = local.Files, local.Directories, local.Symlinks, local.Deleted, local.Bytes
+	res["localFiles"], res["localDirectories"], res["localSymlinks"], res["localDeleted"], res["localBytes"], res["localTotalItems"] = local.Files, local.Directories, local.Symlinks, local.Deleted, local.Bytes, local.TotalItems()
 
 	need := m.NeedSize(folder)
-	res["needFiles"], res["needDirectories"], res["needSymlinks"], res["needDeletes"], res["needBytes"] = need.Files, need.Directories, need.Symlinks, need.Deleted, need.Bytes
+	res["needFiles"], res["needDirectories"], res["needSymlinks"], res["needDeletes"], res["needBytes"], res["needTotalItems"] = need.Files, need.Directories, need.Symlinks, need.Deleted, need.Bytes, need.TotalItems()
+
+	if cfg.Folders()[folder].Type == config.FolderTypeReceiveOnly {
+		// Add statistics for things that have changed locally in a receive
+		// only folder.
+		ro := m.ReceiveOnlyChangedSize(folder)
+		res["receiveOnlyChangedFiles"] = ro.Files
+		res["receiveOnlyChangedDirectories"] = ro.Directories
+		res["receiveOnlyChangedSymlinks"] = ro.Symlinks
+		res["receiveOnlyChangedDeletes"] = ro.Deleted
+		res["receiveOnlyChangedBytes"] = ro.Bytes
+		res["receiveOnlyTotalItems"] = ro.TotalItems()
+	}
 
 	res["inSyncFiles"], res["inSyncBytes"] = global.Files-need.Files, global.Bytes-need.Bytes
 
-	var err error
 	res["state"], res["stateChanged"], err = m.State(folder)
 	if err != nil {
 		res["error"] = err.Error()
@@ -702,7 +715,12 @@ func folderSummary(cfg configIntf, m modelIntf, folder string) map[string]interf
 		}
 	}
 
-	return res
+	err = m.WatchError(folder)
+	if err != nil {
+		res["watchError"] = err.Error()
+	}
+
+	return res, nil
 }
 
 func (s *apiService) postDBOverride(w http.ResponseWriter, r *http.Request) {
@@ -711,11 +729,13 @@ func (s *apiService) postDBOverride(w http.ResponseWriter, r *http.Request) {
 	go s.model.Override(folder)
 }
 
-func (s *apiService) getDBNeed(w http.ResponseWriter, r *http.Request) {
-	qs := r.URL.Query()
+func (s *apiService) postDBRevert(w http.ResponseWriter, r *http.Request) {
+	var qs = r.URL.Query()
+	var folder = qs.Get("folder")
+	go s.model.Revert(folder)
+}
 
-	folder := qs.Get("folder")
-
+func getPagingParams(qs url.Values) (int, int) {
 	page, err := strconv.Atoi(qs.Get("page"))
 	if err != nil || page < 1 {
 		page = 1
@@ -724,17 +744,65 @@ func (s *apiService) getDBNeed(w http.ResponseWriter, r *http.Request) {
 	if err != nil || perpage < 1 {
 		perpage = 1 << 16
 	}
+	return page, perpage
+}
 
-	progress, queued, rest, total := s.model.NeedFolderFiles(folder, page, perpage)
+func (s *apiService) getDBNeed(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+
+	folder := qs.Get("folder")
+
+	page, perpage := getPagingParams(qs)
+
+	progress, queued, rest := s.model.NeedFolderFiles(folder, page, perpage)
 
 	// Convert the struct to a more loose structure, and inject the size.
 	sendJSON(w, map[string]interface{}{
-		"progress": s.toNeedSlice(progress),
-		"queued":   s.toNeedSlice(queued),
-		"rest":     s.toNeedSlice(rest),
-		"total":    total,
+		"progress": toJsonFileInfoSlice(progress),
+		"queued":   toJsonFileInfoSlice(queued),
+		"rest":     toJsonFileInfoSlice(rest),
 		"page":     page,
 		"perpage":  perpage,
+	})
+}
+
+func (s *apiService) getDBRemoteNeed(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+
+	folder := qs.Get("folder")
+	device := qs.Get("device")
+	deviceID, err := protocol.DeviceIDFromString(device)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	page, perpage := getPagingParams(qs)
+
+	if files, err := s.model.RemoteNeedFolderFiles(deviceID, folder, page, perpage); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+	} else {
+		sendJSON(w, map[string]interface{}{
+			"files":   toJsonFileInfoSlice(files),
+			"page":    page,
+			"perpage": perpage,
+		})
+	}
+}
+
+func (s *apiService) getDBLocalChanged(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+
+	folder := qs.Get("folder")
+
+	page, perpage := getPagingParams(qs)
+
+	files := s.model.LocalChangedFiles(folder, page, perpage)
+
+	sendJSON(w, map[string]interface{}{
+		"files":   toJsonFileInfoSlice(files),
+		"page":    page,
+		"perpage": perpage,
 	})
 }
 
@@ -763,7 +831,7 @@ func (s *apiService) getDBFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	av := s.model.Availability(folder, file, protocol.Vector{}, protocol.BlockInfo{})
+	av := s.model.Availability(folder, gf, protocol.BlockInfo{})
 	sendJSON(w, map[string]interface{}{
 		"global":       jsonFileInfo(gf),
 		"local":        jsonFileInfo(lf),
@@ -788,7 +856,7 @@ func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if to.GUI.Password != s.cfg.GUI().Password {
-		if to.GUI.Password != "" {
+		if to.GUI.Password != "" && !bcryptExpr.MatchString(to.GUI.Password) {
 			hash, err := bcrypt.GenerateFromPassword([]byte(to.GUI.Password), 0)
 			if err != nil {
 				l.Warnln("bcrypting password:", err)
@@ -800,24 +868,15 @@ func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fixup usage reporting settings
+	// Activate and save. Wait for the configuration to become active before
+	// completing the request.
 
-	if curAcc := s.cfg.Options().URAccepted; to.Options.URAccepted > curAcc {
-		// UR was enabled
-		to.Options.URAccepted = usageReportVersion
-		to.Options.URUniqueID = rand.String(8)
-	} else if to.Options.URAccepted < curAcc {
-		// UR was disabled
-		to.Options.URAccepted = -1
-		to.Options.URUniqueID = ""
-	}
-
-	// Activate and save
-
-	if err := s.cfg.Replace(to); err != nil {
+	if wg, err := s.cfg.Replace(to); err != nil {
 		l.Warnln("Replacing config:", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	} else {
+		wg.Wait()
 	}
 
 	if err := s.cfg.Save(); err != nil {
@@ -833,7 +892,7 @@ func (s *apiService) getSystemConfigInsync(w http.ResponseWriter, r *http.Reques
 
 func (s *apiService) postSystemRestart(w http.ResponseWriter, r *http.Request) {
 	s.flushResponse(`{"ok": "restarting"}`, w)
-	go restart()
+	go exit.Restart()
 }
 
 func (s *apiService) postSystemReset(w http.ResponseWriter, r *http.Request) {
@@ -859,12 +918,12 @@ func (s *apiService) postSystemReset(w http.ResponseWriter, r *http.Request) {
 		s.flushResponse(`{"ok": "resetting folder `+folder+`"}`, w)
 	}
 
-	go restart()
+	go exit.Restart()
 }
 
 func (s *apiService) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
 	s.flushResponse(`{"ok": "shutting down"}`, w)
-	go shutdown()
+	go exit.Shutdown()
 }
 
 func (s *apiService) flushResponse(resp string, w http.ResponseWriter) {
@@ -903,8 +962,10 @@ func (s *apiService) getSystemStatus(w http.ResponseWriter, r *http.Request) {
 	// gives us percent
 	res["cpuPercent"] = s.cpu.Rate() / 10 / float64(runtime.NumCPU())
 	res["pathSeparator"] = string(filepath.Separator)
+	res["urVersionMax"] = usageReportVersion
 	res["uptime"] = int(time.Since(startTime).Seconds())
 	res["startTime"] = startTime
+	res["guiAddressOverridden"] = s.cfg.GUI().IsOverridden()
 
 	sendJSON(w, res)
 }
@@ -928,7 +989,9 @@ func (s *apiService) postSystemErrorClear(w http.ResponseWriter, r *http.Request
 func (s *apiService) getSystemLog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := time.Parse(time.RFC3339, q.Get("since"))
-	l.Debugln(err)
+	if err != nil {
+		l.Debugln(err)
+	}
 	sendJSON(w, map[string][]logger.Line{
 		"messages": s.systemLog.Since(since),
 	})
@@ -937,12 +1000,121 @@ func (s *apiService) getSystemLog(w http.ResponseWriter, r *http.Request) {
 func (s *apiService) getSystemLogTxt(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := time.Parse(time.RFC3339, q.Get("since"))
-	l.Debugln(err)
+	if err != nil {
+		l.Debugln(err)
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 
 	for _, line := range s.systemLog.Since(since) {
 		fmt.Fprintf(w, "%s: %s\n", line.When.Format(time.RFC3339), line.Message)
 	}
+}
+
+type fileEntry struct {
+	name string
+	data []byte
+}
+
+func (s *apiService) getSupportBundle(w http.ResponseWriter, r *http.Request) {
+	var files []fileEntry
+
+	// Redacted configuration as a JSON
+	if jsonConfig, err := json.MarshalIndent(getRedactedConfig(s), "", "  "); err == nil {
+		files = append(files, fileEntry{name: "config.json.txt", data: jsonConfig})
+	} else {
+		l.Warnln("Support bundle: failed to create config.json:", err)
+	}
+
+	// Log as a text
+	var buflog bytes.Buffer
+	for _, line := range s.systemLog.Since(time.Time{}) {
+		fmt.Fprintf(&buflog, "%s: %s\n", line.When.Format(time.RFC3339), line.Message)
+	}
+	files = append(files, fileEntry{name: "log-inmemory.txt", data: buflog.Bytes()})
+
+	// Errors as a JSON
+	if errs := s.guiErrors.Since(time.Time{}); len(errs) > 0 {
+		if jsonError, err := json.MarshalIndent(errs, "", "  "); err != nil {
+			files = append(files, fileEntry{name: "errors.json.txt", data: jsonError})
+		} else {
+			l.Warnln("Support bundle: failed to create errors.json:", err)
+		}
+	}
+
+	// Panic files
+	if panicFiles, err := filepath.Glob(filepath.Join(locations.GetBaseDir(locations.ConfigBaseDir), "panic*")); err == nil {
+		for _, f := range panicFiles {
+			if panicFile, err := ioutil.ReadFile(f); err != nil {
+				l.Warnf("Support bundle: failed to load %s: %s", filepath.Base(f), err)
+			} else {
+				files = append(files, fileEntry{name: filepath.Base(f), data: panicFile})
+			}
+		}
+	}
+
+	// Archived log (default on Windows)
+	if logFile, err := ioutil.ReadFile(locations.Get(locations.LogFile)); err == nil {
+		files = append(files, fileEntry{name: "log-ondisk.txt", data: logFile})
+	}
+
+	// Version and platform information as a JSON
+	if versionPlatform, err := json.MarshalIndent(map[string]string{
+		"now":         time.Now().Format(time.RFC3339),
+		"version":     build.Version,
+		"codename":    build.Codename,
+		"longVersion": build.LongVersion,
+		"os":          runtime.GOOS,
+		"arch":        runtime.GOARCH,
+	}, "", "  "); err == nil {
+		files = append(files, fileEntry{name: "version-platform.json.txt", data: versionPlatform})
+	} else {
+		l.Warnln("Failed to create versionPlatform.json: ", err)
+	}
+
+	// Report Data as a JSON
+	if usageReportingData, err := json.MarshalIndent(reportData(s.cfg, s.model, s.connectionsService, usageReportVersion, true), "", "  "); err != nil {
+		l.Warnln("Support bundle: failed to create versionPlatform.json:", err)
+	} else {
+		files = append(files, fileEntry{name: "usage-reporting.json.txt", data: usageReportingData})
+	}
+
+	// Heap and CPU Proofs as a pprof extension
+	var heapBuffer, cpuBuffer bytes.Buffer
+	filename := fmt.Sprintf("syncthing-heap-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, build.Version, time.Now().Format("150405")) // hhmmss
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(&heapBuffer); err == nil {
+		files = append(files, fileEntry{name: filename, data: heapBuffer.Bytes()})
+	}
+
+	const duration = 4 * time.Second
+	filename = fmt.Sprintf("syncthing-cpu-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, build.Version, time.Now().Format("150405")) // hhmmss
+	if err := pprof.StartCPUProfile(&cpuBuffer); err == nil {
+		time.Sleep(duration)
+		pprof.StopCPUProfile()
+		files = append(files, fileEntry{name: filename, data: cpuBuffer.Bytes()})
+	}
+
+	// Add buffer files to buffer zip
+	var zipFilesBuffer bytes.Buffer
+	if err := writeZip(&zipFilesBuffer, files); err != nil {
+		l.Warnln("Support bundle: failed to create support bundle zip:", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Set zip file name and path
+	zipFileName := fmt.Sprintf("support-bundle-%s-%s.zip", s.id.Short().String(), time.Now().Format("2006-01-02T150405"))
+	zipFilePath := filepath.Join(locations.GetBaseDir(locations.ConfigBaseDir), zipFileName)
+
+	// Write buffer zip to local zip file (back up)
+	if err := ioutil.WriteFile(zipFilePath, zipFilesBuffer.Bytes(), 0600); err != nil {
+		l.Warnln("Support bundle: support bundle zip could not be created:", err)
+	}
+
+	// Serve the buffer zip to client for download
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", "attachment; filename="+zipFileName)
+	io.Copy(w, &zipFilesBuffer)
 }
 
 func (s *apiService) getSystemHTTPMetrics(w http.ResponseWriter, r *http.Request) {
@@ -981,7 +1153,11 @@ func (s *apiService) getSystemDiscovery(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *apiService) getReport(w http.ResponseWriter, r *http.Request) {
-	sendJSON(w, reportData(s.cfg, s.model))
+	version := usageReportVersion
+	if val, _ := strconv.Atoi(r.URL.Query().Get("version")); val > 0 {
+		version = val
+	}
+	sendJSON(w, reportData(s.cfg, s.model, s.connectionsService, version, true))
 }
 
 func (s *apiService) getRandomString(w http.ResponseWriter, r *http.Request) {
@@ -1109,16 +1285,16 @@ func (s *apiService) getSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := s.cfg.Options()
-	rel, err := upgrade.LatestRelease(opts.ReleasesURL, Version, opts.UpgradeToPreReleases)
+	rel, err := upgrade.LatestRelease(opts.ReleasesURL, build.Version, opts.UpgradeToPreReleases)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	res := make(map[string]interface{})
-	res["running"] = Version
+	res["running"] = build.Version
 	res["latest"] = rel.Tag
-	res["newer"] = upgrade.CompareVersions(rel.Tag, Version) == upgrade.Newer
-	res["majorNewer"] = upgrade.CompareVersions(rel.Tag, Version) == upgrade.MajorNewer
+	res["newer"] = upgrade.CompareVersions(rel.Tag, build.Version) == upgrade.Newer
+	res["majorNewer"] = upgrade.CompareVersions(rel.Tag, build.Version) == upgrade.MajorNewer
 
 	sendJSON(w, res)
 }
@@ -1151,14 +1327,14 @@ func (s *apiService) getLang(w http.ResponseWriter, r *http.Request) {
 
 func (s *apiService) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 	opts := s.cfg.Options()
-	rel, err := upgrade.LatestRelease(opts.ReleasesURL, Version, opts.UpgradeToPreReleases)
+	rel, err := upgrade.LatestRelease(opts.ReleasesURL, build.Version, opts.UpgradeToPreReleases)
 	if err != nil {
 		l.Warnln("getting latest release:", err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	if upgrade.CompareVersions(rel.Tag, Version) > upgrade.Equal {
+	if upgrade.CompareVersions(rel.Tag, build.Version) > upgrade.Equal {
 		err = upgrade.To(rel)
 		if err != nil {
 			l.Warnln("upgrading:", err)
@@ -1167,8 +1343,7 @@ func (s *apiService) postSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.flushResponse(`{"ok": "restarting"}`, w)
-		l.Infoln("Upgrading")
-		stop <- exitUpgrading
+		exit.ExitUpgrading()
 	}
 }
 
@@ -1201,7 +1376,7 @@ func (s *apiService) makeDevicePauseHandler(paused bool) http.HandlerFunc {
 			cfgs = append(cfgs, cfg)
 		}
 
-		if err := s.cfg.SetDevices(cfgs); err != nil {
+		if _, err := s.cfg.SetDevices(cfgs); err != nil {
 			http.Error(w, err.Error(), 500)
 		}
 	}
@@ -1260,7 +1435,7 @@ func (s *apiService) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 	for _, folder := range s.cfg.Folders() {
 		for _, device := range folder.DeviceIDs() {
 			deviceStr := device.String()
-			if s.model.ConnectedTo(device) {
+			if _, ok := s.model.Connection(device); ok {
 				tot[deviceStr] += s.model.Completion(device, folder.ID).CompletionPct
 			} else {
 				tot[deviceStr] = 0
@@ -1277,21 +1452,107 @@ func (s *apiService) getPeerCompletion(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, comp)
 }
 
+func (s *apiService) getFolderVersions(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+	versions, err := s.model.GetFolderVersions(qs.Get("folder"))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	sendJSON(w, versions)
+}
+
+func (s *apiService) postFolderVersionsRestore(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+
+	bs, err := ioutil.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	var versions map[string]time.Time
+	err = json.Unmarshal(bs, &versions)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	ferr, err := s.model.RestoreFolderVersions(qs.Get("folder"), versions)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	sendJSON(w, ferr)
+}
+
+func (s *apiService) getFolderErrors(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+	folder := qs.Get("folder")
+	page, perpage := getPagingParams(qs)
+
+	errors, err := s.model.FolderErrors(folder)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	start := (page - 1) * perpage
+	if start >= len(errors) {
+		errors = nil
+	} else {
+		errors = errors[start:]
+		if perpage < len(errors) {
+			errors = errors[:perpage]
+		}
+	}
+
+	sendJSON(w, map[string]interface{}{
+		"folder":  folder,
+		"errors":  errors,
+		"page":    page,
+		"perpage": perpage,
+	})
+}
+
 func (s *apiService) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	current := qs.Get("current")
+
 	// Default value or in case of error unmarshalling ends up being basic fs.
 	var fsType fs.FilesystemType
 	fsType.UnmarshalText([]byte(qs.Get("filesystem")))
 
+	sendJSON(w, browseFiles(current, fsType))
+}
+
+const (
+	matchExact int = iota
+	matchCaseIns
+	noMatch
+)
+
+func checkPrefixMatch(s, prefix string) int {
+	if strings.HasPrefix(s, prefix) {
+		return matchExact
+	}
+
+	if strings.HasPrefix(strings.ToLower(s), strings.ToLower(prefix)) {
+		return matchCaseIns
+	}
+
+	return noMatch
+}
+
+func browseFiles(current string, fsType fs.FilesystemType) []string {
 	if current == "" {
 		filesystem := fs.NewFilesystem(fsType, "")
 		if roots, err := filesystem.Roots(); err == nil {
-			sendJSON(w, roots)
-		} else {
-			http.Error(w, err.Error(), 500)
+			return roots
 		}
-		return
+		return nil
 	}
 	search, _ := fs.ExpandTilde(current)
 	pathSeparator := string(fs.PathSeparator)
@@ -1300,21 +1561,39 @@ func (s *apiService) getSystemBrowse(w http.ResponseWriter, r *http.Request) {
 		search = search + pathSeparator
 	}
 	searchDir := filepath.Dir(search)
-	searchFile := filepath.Base(search)
+
+	// The searchFile should be the last component of search, or empty if it
+	// ends with a path separator
+	var searchFile string
+	if !strings.HasSuffix(search, pathSeparator) {
+		searchFile = filepath.Base(search)
+	}
 
 	fs := fs.NewFilesystem(fsType, searchDir)
 
-	subdirectories, _ := fs.Glob(searchFile + "*")
+	subdirectories, _ := fs.DirNames(".")
 
-	ret := make([]string, 0, len(subdirectories))
+	exactMatches := make([]string, 0, len(subdirectories))
+	caseInsMatches := make([]string, 0, len(subdirectories))
+
 	for _, subdirectory := range subdirectories {
 		info, err := fs.Stat(subdirectory)
-		if err == nil && info.IsDir() {
-			ret = append(ret, subdirectory+pathSeparator)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+
+		switch checkPrefixMatch(subdirectory, searchFile) {
+		case matchExact:
+			exactMatches = append(exactMatches, filepath.Join(searchDir, subdirectory)+pathSeparator)
+		case matchCaseIns:
+			caseInsMatches = append(caseInsMatches, filepath.Join(searchDir, subdirectory)+pathSeparator)
 		}
 	}
 
-	sendJSON(w, ret)
+	// sort to return matches in deterministic order (don't depend on file system order)
+	sort.Strings(exactMatches)
+	sort.Strings(caseInsMatches)
+	return append(exactMatches, caseInsMatches...)
 }
 
 func (s *apiService) getCPUProf(w http.ResponseWriter, r *http.Request) {
@@ -1323,18 +1602,19 @@ func (s *apiService) getCPUProf(w http.ResponseWriter, r *http.Request) {
 		duration = 30 * time.Second
 	}
 
-	filename := fmt.Sprintf("syncthing-cpu-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, Version, time.Now().Format("150405")) // hhmmss
+	filename := fmt.Sprintf("syncthing-cpu-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, build.Version, time.Now().Format("150405")) // hhmmss
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 
-	pprof.StartCPUProfile(w)
-	time.Sleep(duration)
-	pprof.StopCPUProfile()
+	if err := pprof.StartCPUProfile(w); err == nil {
+		time.Sleep(duration)
+		pprof.StopCPUProfile()
+	}
 }
 
 func (s *apiService) getHeapProf(w http.ResponseWriter, r *http.Request) {
-	filename := fmt.Sprintf("syncthing-heap-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, Version, time.Now().Format("150405")) // hhmmss
+	filename := fmt.Sprintf("syncthing-heap-%s-%s-%s-%s.pprof", runtime.GOOS, runtime.GOARCH, build.Version, time.Now().Format("150405")) // hhmmss
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
@@ -1343,7 +1623,7 @@ func (s *apiService) getHeapProf(w http.ResponseWriter, r *http.Request) {
 	pprof.WriteHeapProfile(w)
 }
 
-func (s *apiService) toNeedSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
+func toJsonFileInfoSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
 	res := make([]jsonDBFileInfo, len(fs))
 	for i, f := range fs {
 		res[i] = jsonDBFileInfo(f)
@@ -1362,12 +1642,16 @@ func (f jsonFileInfo) MarshalJSON() ([]byte, error) {
 		"size":          f.Size,
 		"permissions":   fmt.Sprintf("%#o", f.Permissions),
 		"deleted":       f.Deleted,
-		"invalid":       f.Invalid,
+		"invalid":       protocol.FileInfo(f).IsInvalid(),
+		"ignored":       protocol.FileInfo(f).IsIgnored(),
+		"mustRescan":    protocol.FileInfo(f).MustRescan(),
 		"noPermissions": f.NoPermissions,
 		"modified":      protocol.FileInfo(f).ModTime(),
+		"modifiedBy":    f.ModifiedBy.String(),
 		"sequence":      f.Sequence,
 		"numBlocks":     len(f.Blocks),
 		"version":       jsonVersionVector(f.Version),
+		"localFlags":    f.LocalFlags,
 	})
 }
 
@@ -1376,14 +1660,20 @@ type jsonDBFileInfo db.FileInfoTruncated
 func (f jsonDBFileInfo) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
 		"name":          f.Name,
-		"type":          f.Type,
+		"type":          f.Type.String(),
 		"size":          f.Size,
 		"permissions":   fmt.Sprintf("%#o", f.Permissions),
 		"deleted":       f.Deleted,
-		"invalid":       f.Invalid,
+		"invalid":       db.FileInfoTruncated(f).IsInvalid(),
+		"ignored":       db.FileInfoTruncated(f).IsIgnored(),
+		"mustRescan":    db.FileInfoTruncated(f).MustRescan(),
 		"noPermissions": f.NoPermissions,
 		"modified":      db.FileInfoTruncated(f).ModTime(),
+		"modifiedBy":    f.ModifiedBy.String(),
 		"sequence":      f.Sequence,
+		"numBlocks":     nil, // explicitly unknown
+		"version":       jsonVersionVector(f.Version),
+		"localFlags":    f.LocalFlags,
 	})
 }
 
@@ -1427,9 +1717,14 @@ func addressIsLocalhost(addr string) bool {
 		host = addr
 	}
 	switch strings.ToLower(host) {
-	case "127.0.0.1", "::1", "localhost":
+	case "localhost", "localhost.":
 		return true
 	default:
-		return false
+		ip := net.ParseIP(host)
+		if ip == nil {
+			// not an IP address
+			return false
+		}
+		return ip.IsLoopback()
 	}
 }

@@ -111,34 +111,32 @@ func (v *Staggered) clean() {
 	}
 
 	versionsPerFile := make(map[string][]string)
-	filesPerDir := make(map[string]int)
+	dirTracker := make(emptyDirTracker)
 
-	err := v.versionsFs.Walk(".", func(path string, f fs.FileInfo, err error) error {
+	walkFn := func(path string, f fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
 		if f.IsDir() && !f.IsSymlink() {
-			filesPerDir[path] = 0
-			if path != "." {
-				dir := filepath.Dir(path)
-				filesPerDir[dir]++
-			}
-		} else {
-			// Regular file, or possibly a symlink.
-			ext := filepath.Ext(path)
-			versionTag := filenameTag(path)
-			dir := filepath.Dir(path)
-			withoutExt := path[:len(path)-len(ext)-len(versionTag)-1]
-			name := withoutExt + ext
-
-			filesPerDir[dir]++
-			versionsPerFile[name] = append(versionsPerFile[name], path)
+			dirTracker.addDir(path)
+			return nil
 		}
 
+		// Regular file, or possibly a symlink.
+		dirTracker.addFile(path)
+
+		name, _ := UntagFilename(path)
+		if name == "" {
+			return nil
+		}
+
+		versionsPerFile[name] = append(versionsPerFile[name], path)
+
 		return nil
-	})
-	if err != nil {
+	}
+
+	if err := v.versionsFs.Walk(".", walkFn); err != nil {
 		l.Warnln("Versioner: error scanning versions dir", err)
 		return
 	}
@@ -148,17 +146,7 @@ func (v *Staggered) clean() {
 		v.expire(versionList)
 	}
 
-	for path, numFiles := range filesPerDir {
-		if numFiles > 0 {
-			continue
-		}
-
-		l.Debugln("Cleaner: deleting empty directory", path)
-		err = v.versionsFs.Remove(path)
-		if err != nil {
-			l.Warnln("Versioner: can't remove directory", path, err)
-		}
-	}
+	dirTracker.deleteEmptyDirs(v.versionsFs)
 
 	l.Debugln("Cleaner: Finished cleaning", v.versionsFs)
 }
@@ -186,7 +174,7 @@ func (v *Staggered) toRemove(versions []string, now time.Time) []string {
 	var remove []string
 	for _, file := range versions {
 		loc, _ := time.LoadLocation("Local")
-		versionTime, err := time.ParseInLocation(TimeFormat, filenameTag(file), loc)
+		versionTime, err := time.ParseInLocation(TimeFormat, ExtractTag(file), loc)
 		if err != nil {
 			l.Debugf("Versioner: file name %q is invalid: %v", file, err)
 			continue
@@ -271,7 +259,7 @@ func (v *Staggered) Archive(filePath string) error {
 		return err
 	}
 
-	ver := taggedFilename(file, time.Now().Format(TimeFormat))
+	ver := TagFilename(file, time.Now().Format(TimeFormat))
 	dst := filepath.Join(inFolderPath, ver)
 	l.Debugln("moving to", dst)
 
@@ -286,7 +274,7 @@ func (v *Staggered) Archive(filePath string) error {
 	}
 
 	// Glob according to the new file~timestamp.ext pattern.
-	pattern := filepath.Join(inFolderPath, taggedFilename(file, TimeGlob))
+	pattern := filepath.Join(inFolderPath, TagFilename(file, TimeGlob))
 	newVersions, err := v.versionsFs.Glob(pattern)
 	if err != nil {
 		l.Warnln("globbing:", err, "for", pattern)

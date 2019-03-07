@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -24,6 +26,7 @@ import (
 	"github.com/d4l3k/messagediff"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/thejerf/suture"
@@ -74,7 +77,9 @@ func TestStopAfterBrokenConfig(t *testing.T) {
 	srv := newAPIService(protocol.LocalDeviceID, w, "../../test/h1/https-cert.pem", "../../test/h1/https-key.pem", "", nil, nil, nil, nil, nil, nil, nil, nil)
 	srv.started = make(chan string)
 
-	sup := suture.NewSimple("test")
+	sup := suture.New("test", suture.Spec{
+		PassThroughPanics: true,
+	})
 	sup.Add(srv)
 	sup.ServeBackground()
 
@@ -484,7 +489,9 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 	svc.started = addrChan
 
 	// Actually start the API service
-	supervisor := suture.NewSimple("API test")
+	supervisor := suture.New("API test", suture.Spec{
+		PassThroughPanics: true,
+	})
 	supervisor.Add(svc)
 	supervisor.ServeBackground()
 
@@ -839,16 +846,24 @@ func TestAddressIsLocalhost(t *testing.T) {
 		// These are all valid localhost addresses
 		{"localhost", true},
 		{"LOCALHOST", true},
+		{"localhost.", true},
 		{"::1", true},
 		{"127.0.0.1", true},
+		{"127.23.45.56", true},
 		{"localhost:8080", true},
 		{"LOCALHOST:8000", true},
+		{"localhost.:8080", true},
 		{"[::1]:8080", true},
 		{"127.0.0.1:8080", true},
+		{"127.23.45.56:8080", true},
 
 		// These are all non-localhost addresses
 		{"example.com", false},
 		{"example.com:8080", false},
+		{"localhost.com", false},
+		{"localhost.com:8080", false},
+		{"www.localhost", false},
+		{"www.localhost:8080", false},
 		{"192.0.2.10", false},
 		{"192.0.2.10:8080", false},
 		{"0.0.0.0", false},
@@ -956,4 +971,88 @@ func TestEventMasks(t *testing.T) {
 	if res := svc.getEventSub(events.LocalIndexUpdated); res == nil || res == defSub || res == diskSub {
 		t.Errorf("should have returned a valid, non-default event sub")
 	}
+}
+
+func TestBrowse(t *testing.T) {
+	pathSep := string(os.PathSeparator)
+
+	tmpDir, err := ioutil.TempDir("", "syncthing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := os.Mkdir(filepath.Join(tmpDir, "dir"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ioutil.WriteFile(filepath.Join(tmpDir, "file"), []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(tmpDir, "MiXEDCase"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// We expect completion to return the full path to the completed
+	// directory, with an ending slash.
+	dirPath := filepath.Join(tmpDir, "dir") + pathSep
+	mixedCaseDirPath := filepath.Join(tmpDir, "MiXEDCase") + pathSep
+
+	cases := []struct {
+		current string
+		returns []string
+	}{
+		// The direcotory without slash is completed to one with slash.
+		{tmpDir, []string{tmpDir + pathSep}},
+		// With slash it's completed to its contents.
+		// Dirs are given pathSeps.
+		// Files are not returned.
+		{tmpDir + pathSep, []string{mixedCaseDirPath, dirPath}},
+		// Globbing is automatic based on prefix.
+		{tmpDir + pathSep + "d", []string{dirPath}},
+		{tmpDir + pathSep + "di", []string{dirPath}},
+		{tmpDir + pathSep + "dir", []string{dirPath}},
+		{tmpDir + pathSep + "f", nil},
+		{tmpDir + pathSep + "q", nil},
+		// Globbing is case-insensitve
+		{tmpDir + pathSep + "mixed", []string{mixedCaseDirPath}},
+	}
+
+	for _, tc := range cases {
+		ret := browseFiles(tc.current, fs.FilesystemTypeBasic)
+		if !equalStrings(ret, tc.returns) {
+			t.Errorf("browseFiles(%q) => %q, expected %q", tc.current, ret, tc.returns)
+		}
+	}
+}
+
+func TestPrefixMatch(t *testing.T) {
+	cases := []struct {
+		s        string
+		prefix   string
+		expected int
+	}{
+		{"aaaA", "aaa", matchExact},
+		{"AAAX", "BBB", noMatch},
+		{"AAAX", "aAa", matchCaseIns},
+		{"äÜX", "äü", matchCaseIns},
+	}
+
+	for _, tc := range cases {
+		ret := checkPrefixMatch(tc.s, tc.prefix)
+		if ret != tc.expected {
+			t.Errorf("checkPrefixMatch(%q, %q) => %v, expected %v", tc.s, tc.prefix, ret, tc.expected)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -9,11 +9,11 @@
 
 body {
     padding-bottom: 70px;
-    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
 }
 
 h1, h2, h3, h4, h5 {
-    font-family: "Raleway", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-family: "Raleway", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     line-height: 1.25;
 }
 
@@ -271,21 +271,6 @@ ul.three-columns li, ul.two-columns li {
     z-index: 980;
 }
 
-.globalChanges-path-col {
-  /* These are technically the same, but use both */
-  overflow-wrap: break-word;
-  word-wrap: break-word;
-
-  -ms-word-break: break-all;
-  /* This is the dangerous one in WebKit, as it breaks things wherever */
-  word-break: break-all;
-  /* Instead use this non-standard one: */
-  word-break: break-word;
-}
-.globalChanges-time-col {
-    width: 100px;
-}
-
 /** Footer nav on small devices **/
 @media (max-width: 1199px) {
     /* Stay at the end of the page, with space reserved for the footer
@@ -366,4 +351,12 @@ ul.three-columns li, ul.two-columns li {
     .navbar-fixed-bottom li {
          width: 100%;
     }
+}
+
+.tab-content {
+    padding-top: 10px;
+}
+
+.fancytree-ext-table {
+    width: 100% !important;
 }

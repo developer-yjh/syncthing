@@ -48,9 +48,6 @@ case "${1:-default}" in
 		;;
 
 	test)
-		ulimit -t 600 &>/dev/null || true
-		ulimit -d 512000 &>/dev/null || true
-		ulimit -m 512000 &>/dev/null || true
 		LOGGER_DISCARD=1 build test
 		;;
 
@@ -62,8 +59,8 @@ case "${1:-default}" in
 		go run script/authors.go
 		build transifex
 		pushd man ; ./refresh.sh ; popd
-		git add -A gui man
-		git commit -m 'gui, man: Update docs & translations'
+		git add -A gui man AUTHORS
+		git commit -m 'gui, man, authors: Update docs, translations, and contributors'
 		;;
 
 	noupgrade)
@@ -94,9 +91,6 @@ case "${1:-default}" in
 		;;
 
 	test-xunit)
-		ulimit -t 600 &>/dev/null || true
-		ulimit -d 512000 &>/dev/null || true
-		ulimit -m 512000 &>/dev/null || true
 
 		(GOPATH="$(pwd)/Godeps/_workspace:$GOPATH" go test -v -race ./lib/... ./cmd/... || true) > tests.out
 		go2xunit -output tests.xml -fail < tests.out

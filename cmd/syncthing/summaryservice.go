@@ -9,7 +9,9 @@ package main
 import (
 	"time"
 
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/thejerf/suture"
@@ -20,8 +22,8 @@ import (
 type folderSummaryService struct {
 	*suture.Supervisor
 
-	cfg       configIntf
-	model     modelIntf
+	cfg       config.Wrapper
+	model     model.Model
 	stop      chan struct{}
 	immediate chan string
 
@@ -34,9 +36,11 @@ type folderSummaryService struct {
 	lastEventReqMut sync.Mutex
 }
 
-func newFolderSummaryService(cfg configIntf, m modelIntf) *folderSummaryService {
+func newFolderSummaryService(cfg config.Wrapper, m model.Model) *folderSummaryService {
 	service := &folderSummaryService{
-		Supervisor:      suture.NewSimple("folderSummaryService"),
+		Supervisor: suture.New("folderSummaryService", suture.Spec{
+			PassThroughPanics: true,
+		}),
 		cfg:             cfg,
 		model:           m,
 		stop:            make(chan struct{}),
@@ -60,7 +64,7 @@ func (c *folderSummaryService) Stop() {
 // listenForUpdates subscribes to the event bus and makes note of folders that
 // need their data recalculated.
 func (c *folderSummaryService) listenForUpdates() {
-	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected)
+	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected | events.FolderWatchStateChanged)
 	defer events.Default.Unsubscribe(sub)
 
 	for {
@@ -105,14 +109,14 @@ func (c *folderSummaryService) listenForUpdates() {
 					// c.immediate must be nonblocking so that we can continue
 					// handling events.
 
+					c.foldersMut.Lock()
 					select {
 					case c.immediate <- folder:
-						c.foldersMut.Lock()
 						delete(c.folders, folder)
-						c.foldersMut.Unlock()
-
 					default:
+						c.folders[folder] = struct{}{}
 					}
+					c.foldersMut.Unlock()
 				}
 
 			default:
@@ -187,7 +191,10 @@ func (c *folderSummaryService) foldersToHandle() []string {
 func (c *folderSummaryService) sendSummary(folder string) {
 	// The folder summary contains how many bytes, files etc
 	// are in the folder and how in sync we are.
-	data := folderSummary(c.cfg, c.model, folder)
+	data, err := folderSummary(c.cfg, c.model, folder)
+	if err != nil {
+		return
+	}
 	events.Default.Log(events.FolderSummary, map[string]interface{}{
 		"folder":  folder,
 		"summary": data,
@@ -198,21 +205,17 @@ func (c *folderSummaryService) sendSummary(folder string) {
 			// We already know about ourselves.
 			continue
 		}
-		if !c.model.ConnectedTo(devCfg.DeviceID) {
+		if _, ok := c.model.Connection(devCfg.DeviceID); !ok {
 			// We're not interested in disconnected devices.
 			continue
 		}
 
 		// Get completion percentage of this folder for the
 		// remote device.
-		comp := c.model.Completion(devCfg.DeviceID, folder)
-		events.Default.Log(events.FolderCompletion, map[string]interface{}{
-			"folder":      folder,
-			"device":      devCfg.DeviceID.String(),
-			"completion":  comp.CompletionPct,
-			"needBytes":   comp.NeedBytes,
-			"globalBytes": comp.GlobalBytes,
-		})
+		comp := jsonCompletion(c.model.Completion(devCfg.DeviceID, folder))
+		comp["folder"] = folder
+		comp["device"] = devCfg.DeviceID.String()
+		events.Default.Log(events.FolderCompletion, comp)
 	}
 }
 

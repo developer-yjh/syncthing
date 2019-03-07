@@ -7,6 +7,7 @@
 package fs
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -18,9 +19,10 @@ import (
 // The Filesystem interface abstracts access to the file system.
 type Filesystem interface {
 	Chmod(name string, mode FileMode) error
+	Lchown(name string, uid, gid int) error
 	Chtimes(name string, atime time.Time, mtime time.Time) error
 	Create(name string) (File, error)
-	CreateSymlink(name, target string) error
+	CreateSymlink(target, name string) error
 	DirNames(name string) ([]string, error)
 	Lstat(name string) (FileInfo, error)
 	Mkdir(name string, perm FileMode) error
@@ -33,7 +35,8 @@ type Filesystem interface {
 	Rename(oldname, newname string) error
 	Stat(name string) (FileInfo, error)
 	SymlinksSupported() bool
-	Walk(root string, walkFn WalkFunc) error
+	Walk(name string, walkFn WalkFunc) error
+	Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error)
 	Hide(name string) error
 	Unhide(name string) error
 	Glob(pattern string) ([]string, error)
@@ -41,6 +44,7 @@ type Filesystem interface {
 	Usage(name string) (Usage, error)
 	Type() FilesystemType
 	URI() string
+	SameFile(fi1, fi2 FileInfo) bool
 }
 
 // The File interface abstracts access to a regular file, being a somewhat
@@ -71,10 +75,16 @@ type FileInfo interface {
 	// Extensions
 	IsRegular() bool
 	IsSymlink() bool
+	Owner() int
+	Group() int
 }
 
 // FileMode is similar to os.FileMode
 type FileMode uint32
+
+func (fm FileMode) String() string {
+	return os.FileMode(fm).String()
+}
 
 // Usage represents filesystem space usage
 type Usage struct {
@@ -82,12 +92,56 @@ type Usage struct {
 	Total int64
 }
 
+type Matcher interface {
+	ShouldIgnore(name string) bool
+	SkipIgnoredDirs() bool
+}
+
+type MatchResult interface {
+	IsIgnored() bool
+}
+
+type Event struct {
+	Name string
+	Type EventType
+}
+
+type EventType int
+
+const (
+	NonRemove EventType = 1 + iota
+	Remove
+	Mixed // Should probably not be necessary to be used in filesystem interface implementation
+)
+
+// Merge returns Mixed, except if evType and other are the same and not Mixed.
+func (evType EventType) Merge(other EventType) EventType {
+	return evType | other
+}
+
+func (evType EventType) String() string {
+	switch {
+	case evType == NonRemove:
+		return "non-remove"
+	case evType == Remove:
+		return "remove"
+	case evType == Mixed:
+		return "mixed"
+	default:
+		panic("bug: Unknown event type")
+	}
+}
+
+var ErrWatchNotSupported = errors.New("watching is not supported")
+
 // Equivalents from os package.
 
 const ModePerm = FileMode(os.ModePerm)
 const ModeSetgid = FileMode(os.ModeSetgid)
 const ModeSetuid = FileMode(os.ModeSetuid)
 const ModeSticky = FileMode(os.ModeSticky)
+const ModeSymlink = FileMode(os.ModeSymlink)
+const ModeType = FileMode(os.ModeType)
 const PathSeparator = os.PathSeparator
 const OptAppend = os.O_APPEND
 const OptCreate = os.O_CREATE
@@ -119,7 +173,9 @@ func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
 	var fs Filesystem
 	switch fsType {
 	case FilesystemTypeBasic:
-		fs = NewWalkFilesystem(newBasicFilesystem(uri))
+		fs = newBasicFilesystem(uri)
+	case FilesystemTypeFake:
+		fs = newFakeFilesystem(uri)
 	default:
 		l.Debugln("Unknown filesystem", fsType, uri)
 		fs = &errorFilesystem{
@@ -129,25 +185,66 @@ func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
 		}
 	}
 
-	if l.ShouldDebug("filesystem") {
-		fs = &logFilesystem{fs}
+	if l.ShouldDebug("walkfs") {
+		return NewWalkFilesystem(&logFilesystem{fs})
 	}
-	return fs
+
+	if l.ShouldDebug("fs") {
+		return &logFilesystem{NewWalkFilesystem(fs)}
+	}
+
+	return NewWalkFilesystem(fs)
 }
 
 // IsInternal returns true if the file, as a path relative to the folder
 // root, represents an internal file that should always be ignored. The file
 // path must be clean (i.e., in canonical shortest form).
 func IsInternal(file string) bool {
+	// fs cannot import config, so we hard code .stfolder here (config.DefaultMarkerName)
 	internals := []string{".stfolder", ".stignore", ".stversions"}
-	pathSep := string(PathSeparator)
 	for _, internal := range internals {
 		if file == internal {
 			return true
 		}
-		if strings.HasPrefix(file, internal+pathSep) {
+		if IsParent(file, internal) {
 			return true
 		}
 	}
 	return false
+}
+
+// Canonicalize checks that the file path is valid and returns it in the "canonical" form:
+// - /foo/bar -> foo/bar
+// - / -> "."
+func Canonicalize(file string) (string, error) {
+	pathSep := string(PathSeparator)
+
+	if strings.HasPrefix(file, pathSep+pathSep) {
+		// The relative path may pretend to be an absolute path within
+		// the root, but the double path separator on Windows implies
+		// something else and is out of spec.
+		return "", ErrNotRelative
+	}
+
+	// The relative path should be clean from internal dotdots and similar
+	// funkyness.
+	file = filepath.Clean(file)
+
+	// It is not acceptable to attempt to traverse upwards.
+	switch file {
+	case "..":
+		return "", ErrNotRelative
+	}
+	if strings.HasPrefix(file, ".."+pathSep) {
+		return "", ErrNotRelative
+	}
+
+	if strings.HasPrefix(file, pathSep) {
+		if file == pathSep {
+			return ".", nil
+		}
+		return file[1:], nil
+	}
+
+	return file, nil
 }

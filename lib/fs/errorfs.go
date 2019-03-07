@@ -6,7 +6,10 @@
 
 package fs
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type errorFilesystem struct {
 	err    error
@@ -15,9 +18,10 @@ type errorFilesystem struct {
 }
 
 func (fs *errorFilesystem) Chmod(name string, mode FileMode) error                      { return fs.err }
+func (fs *errorFilesystem) Lchown(name string, uid, gid int) error                      { return fs.err }
 func (fs *errorFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error { return fs.err }
 func (fs *errorFilesystem) Create(name string) (File, error)                            { return nil, fs.err }
-func (fs *errorFilesystem) CreateSymlink(name, target string) error                     { return fs.err }
+func (fs *errorFilesystem) CreateSymlink(target, name string) error                     { return fs.err }
 func (fs *errorFilesystem) DirNames(name string) ([]string, error)                      { return nil, fs.err }
 func (fs *errorFilesystem) Lstat(name string) (FileInfo, error)                         { return nil, fs.err }
 func (fs *errorFilesystem) Mkdir(name string, perm FileMode) error                      { return fs.err }
@@ -39,3 +43,7 @@ func (fs *errorFilesystem) Roots() ([]string, error)                            
 func (fs *errorFilesystem) Usage(name string) (Usage, error)                            { return Usage{}, fs.err }
 func (fs *errorFilesystem) Type() FilesystemType                                        { return fs.fsType }
 func (fs *errorFilesystem) URI() string                                                 { return fs.uri }
+func (fs *errorFilesystem) SameFile(fi1, fi2 FileInfo) bool                             { return false }
+func (fs *errorFilesystem) Watch(path string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error) {
+	return nil, fs.err
+}

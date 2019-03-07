@@ -7,6 +7,7 @@
 package util
 
 import (
+	"fmt"
 	"net/url"
 	"reflect"
 	"sort"
@@ -14,8 +15,12 @@ import (
 	"strings"
 )
 
+type defaultParser interface {
+	ParseDefault(string) error
+}
+
 // SetDefaults sets default values on a struct, based on the default annotation.
-func SetDefaults(data interface{}) error {
+func SetDefaults(data interface{}) {
 	s := reflect.ValueOf(data).Elem()
 	t := s.Type()
 
@@ -25,15 +30,22 @@ func SetDefaults(data interface{}) error {
 
 		v := tag.Get("default")
 		if len(v) > 0 {
-			if parser, ok := f.Interface().(interface {
-				ParseDefault(string) (interface{}, error)
-			}); ok {
-				val, err := parser.ParseDefault(v)
-				if err != nil {
-					panic(err)
+			if f.CanInterface() {
+				if parser, ok := f.Interface().(defaultParser); ok {
+					if err := parser.ParseDefault(v); err != nil {
+						panic(err)
+					}
+					continue
 				}
-				f.Set(reflect.ValueOf(val))
-				continue
+			}
+
+			if f.CanAddr() && f.Addr().CanInterface() {
+				if parser, ok := f.Addr().Interface().(defaultParser); ok {
+					if err := parser.ParseDefault(v); err != nil {
+						panic(err)
+					}
+					continue
+				}
 			}
 
 			switch f.Interface().(type) {
@@ -43,14 +55,14 @@ func SetDefaults(data interface{}) error {
 			case int:
 				i, err := strconv.ParseInt(v, 10, 64)
 				if err != nil {
-					return err
+					panic(err)
 				}
 				f.SetInt(i)
 
 			case float64:
 				i, err := strconv.ParseFloat(v, 64)
 				if err != nil {
-					return err
+					panic(err)
 				}
 				f.SetFloat(i)
 
@@ -67,7 +79,36 @@ func SetDefaults(data interface{}) error {
 			}
 		}
 	}
-	return nil
+}
+
+// CopyMatchingTag copies fields tagged tag:"value" from "from" struct onto "to" struct.
+func CopyMatchingTag(from interface{}, to interface{}, tag string, shouldCopy func(value string) bool) {
+	fromStruct := reflect.ValueOf(from).Elem()
+	fromType := fromStruct.Type()
+
+	toStruct := reflect.ValueOf(to).Elem()
+	toType := toStruct.Type()
+
+	if fromType != toType {
+		panic(fmt.Sprintf("non equal types: %s != %s", fromType, toType))
+	}
+
+	for i := 0; i < toStruct.NumField(); i++ {
+		fromField := fromStruct.Field(i)
+		toField := toStruct.Field(i)
+
+		if !toField.CanSet() {
+			// Unexported fields
+			continue
+		}
+
+		structTag := toType.Field(i).Tag
+
+		v := structTag.Get(tag)
+		if shouldCopy(v) {
+			toField.Set(fromField)
+		}
+	}
 }
 
 // UniqueStrings returns a list on unique strings, trimming and sorting them

@@ -14,9 +14,16 @@ import (
 )
 
 var (
-	l = logger.DefaultLogger.NewFacility("filesystem", "Filesystem access")
+	l = logger.DefaultLogger.NewFacility("fs", "Filesystem access")
 )
 
 func init() {
-	l.SetDebug("filesystem", strings.Contains(os.Getenv("STTRACE"), "filesystem") || os.Getenv("STTRACE") == "all")
+	logger.DefaultLogger.NewFacility("walkfs", "Filesystem access while walking")
+	switch {
+	case strings.Contains(os.Getenv("STTRACE"), "walkfs") || os.Getenv("STTRACE") == "all":
+		l.SetDebug("walkfs", true)
+		fallthrough
+	case strings.Contains(os.Getenv("STTRACE"), "fs"):
+		l.SetDebug("fs", true)
+	}
 }

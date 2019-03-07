@@ -12,82 +12,38 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
+	"net"
 	"net/http"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/upgrade"
-	"github.com/thejerf/suture"
 )
 
 // Current version number of the usage report, for acceptance purposes. If
 // fields are added or changed this integer must be incremented so that users
 // are prompted for acceptance of the new report.
-const usageReportVersion = 2
-
-type usageReportingManager struct {
-	cfg   *config.Wrapper
-	model *model.Model
-	sup   *suture.Supervisor
-}
-
-func newUsageReportingManager(cfg *config.Wrapper, m *model.Model) *usageReportingManager {
-	mgr := &usageReportingManager{
-		cfg:   cfg,
-		model: m,
-	}
-
-	// Start UR if it's enabled.
-	mgr.CommitConfiguration(config.Configuration{}, cfg.RawCopy())
-
-	// Listen to future config changes so that we can start and stop as
-	// appropriate.
-	cfg.Subscribe(mgr)
-
-	return mgr
-}
-
-func (m *usageReportingManager) VerifyConfiguration(from, to config.Configuration) error {
-	return nil
-}
-
-func (m *usageReportingManager) CommitConfiguration(from, to config.Configuration) bool {
-	if to.Options.URAccepted >= usageReportVersion && m.sup == nil {
-		// Usage reporting was turned on; lets start it.
-		service := newUsageReportingService(m.cfg, m.model)
-		m.sup = suture.NewSimple("usageReporting")
-		m.sup.Add(service)
-		m.sup.ServeBackground()
-	} else if to.Options.URAccepted < usageReportVersion && m.sup != nil {
-		// Usage reporting was turned off
-		m.sup.Stop()
-		m.sup = nil
-	}
-
-	return true
-}
-
-func (m *usageReportingManager) String() string {
-	return fmt.Sprintf("usageReportingManager@%p", m)
-}
+const usageReportVersion = 3
 
 // reportData returns the data to be sent in a usage report. It's used in
 // various places, so not part of the usageReportingManager object.
-func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
+func reportData(cfg config.Wrapper, m model.Model, connectionsService connections.Service, version int, preview bool) map[string]interface{} {
 	opts := cfg.Options()
 	res := make(map[string]interface{})
-	res["urVersion"] = usageReportVersion
+	res["urVersion"] = version
 	res["uniqueID"] = opts.URUniqueID
-	res["version"] = Version
-	res["longVersion"] = LongVersion
+	res["version"] = build.Version
+	res["longVersion"] = build.LongVersion
 	res["platform"] = runtime.GOOS + "-" + runtime.GOARCH
 	res["numFolders"] = len(cfg.Folders())
 	res["numDevices"] = len(cfg.Devices())
@@ -96,10 +52,10 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	var totBytes, maxBytes int64
 	for folderID := range cfg.Folders() {
 		global := m.GlobalSize(folderID)
-		totFiles += global.Files
+		totFiles += int(global.Files)
 		totBytes += global.Bytes
-		if global.Files > maxFiles {
-			maxFiles = global.Files
+		if int(global.Files) > maxFiles {
+			maxFiles = int(global.Files)
 		}
 		if global.Bytes > maxBytes {
 			maxBytes = global.Bytes
@@ -125,7 +81,9 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 
 	var rescanIntvs []int
 	folderUses := map[string]int{
-		"readonly":            0,
+		"sendonly":            0,
+		"sendreceive":         0,
+		"receiveonly":         0,
 		"ignorePerms":         0,
 		"ignoreDelete":        0,
 		"autoNormalize":       0,
@@ -137,8 +95,13 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	for _, cfg := range cfg.Folders() {
 		rescanIntvs = append(rescanIntvs, cfg.RescanIntervalS)
 
-		if cfg.Type == config.FolderTypeSendOnly {
-			folderUses["readonly"]++
+		switch cfg.Type {
+		case config.FolderTypeSendOnly:
+			folderUses["sendonly"]++
+		case config.FolderTypeSendReceive:
+			folderUses["sendreceive"]++
+		case config.FolderTypeReceiveOnly:
+			folderUses["receiveonly"]++
 		}
 		if cfg.IgnorePerms {
 			folderUses["ignorePerms"]++
@@ -227,27 +190,168 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	res["upgradeAllowedAuto"] = !(upgrade.DisabledByCompilation || noUpgradeFromEnv) && opts.AutoUpgradeIntervalH > 0
 	res["upgradeAllowedPre"] = !(upgrade.DisabledByCompilation || noUpgradeFromEnv) && opts.AutoUpgradeIntervalH > 0 && opts.UpgradeToPreReleases
 
+	if version >= 3 {
+		res["uptime"] = int(time.Since(startTime).Seconds())
+		res["natType"] = connectionsService.NATType()
+		res["alwaysLocalNets"] = len(opts.AlwaysLocalNets) > 0
+		res["cacheIgnoredFiles"] = opts.CacheIgnoredFiles
+		res["overwriteRemoteDeviceNames"] = opts.OverwriteRemoteDevNames
+		res["progressEmitterEnabled"] = opts.ProgressUpdateIntervalS > -1
+		res["customDefaultFolderPath"] = opts.DefaultFolderPath != "~"
+		res["customTrafficClass"] = opts.TrafficClass != 0
+		res["customTempIndexMinBlocks"] = opts.TempIndexMinBlocks != 10
+		res["temporariesDisabled"] = opts.KeepTemporariesH == 0
+		res["temporariesCustom"] = opts.KeepTemporariesH != 24
+		res["limitBandwidthInLan"] = opts.LimitBandwidthInLan
+		res["customReleaseURL"] = opts.ReleasesURL != "https://upgrades.syncthing.net/meta.json"
+		res["restartOnWakeup"] = opts.RestartOnWakeup
+
+		folderUsesV3 := map[string]int{
+			"scanProgressDisabled":    0,
+			"conflictsDisabled":       0,
+			"conflictsUnlimited":      0,
+			"conflictsOther":          0,
+			"disableSparseFiles":      0,
+			"disableTempIndexes":      0,
+			"alwaysWeakHash":          0,
+			"customWeakHashThreshold": 0,
+			"fsWatcherEnabled":        0,
+		}
+		pullOrder := make(map[string]int)
+		filesystemType := make(map[string]int)
+		var fsWatcherDelays []int
+		for _, cfg := range cfg.Folders() {
+			if cfg.ScanProgressIntervalS < 0 {
+				folderUsesV3["scanProgressDisabled"]++
+			}
+			if cfg.MaxConflicts == 0 {
+				folderUsesV3["conflictsDisabled"]++
+			} else if cfg.MaxConflicts < 0 {
+				folderUsesV3["conflictsUnlimited"]++
+			} else {
+				folderUsesV3["conflictsOther"]++
+			}
+			if cfg.DisableSparseFiles {
+				folderUsesV3["disableSparseFiles"]++
+			}
+			if cfg.DisableTempIndexes {
+				folderUsesV3["disableTempIndexes"]++
+			}
+			if cfg.WeakHashThresholdPct < 0 {
+				folderUsesV3["alwaysWeakHash"]++
+			} else if cfg.WeakHashThresholdPct != 25 {
+				folderUsesV3["customWeakHashThreshold"]++
+			}
+			if cfg.FSWatcherEnabled {
+				folderUsesV3["fsWatcherEnabled"]++
+			}
+			pullOrder[cfg.Order.String()]++
+			filesystemType[cfg.FilesystemType.String()]++
+			fsWatcherDelays = append(fsWatcherDelays, cfg.FSWatcherDelayS)
+		}
+		sort.Ints(fsWatcherDelays)
+		folderUsesV3Interface := map[string]interface{}{
+			"pullOrder":       pullOrder,
+			"filesystemType":  filesystemType,
+			"fsWatcherDelays": fsWatcherDelays,
+		}
+		for key, value := range folderUsesV3 {
+			folderUsesV3Interface[key] = value
+		}
+		res["folderUsesV3"] = folderUsesV3Interface
+
+		guiCfg := cfg.GUI()
+		// Anticipate multiple GUI configs in the future, hence store counts.
+		guiStats := map[string]int{
+			"enabled":                   0,
+			"useTLS":                    0,
+			"useAuth":                   0,
+			"insecureAdminAccess":       0,
+			"debugging":                 0,
+			"insecureSkipHostCheck":     0,
+			"insecureAllowFrameLoading": 0,
+			"listenLocal":               0,
+			"listenUnspecified":         0,
+		}
+		theme := make(map[string]int)
+		if guiCfg.Enabled {
+			guiStats["enabled"]++
+			if guiCfg.UseTLS() {
+				guiStats["useTLS"]++
+			}
+			if len(guiCfg.User) > 0 && len(guiCfg.Password) > 0 {
+				guiStats["useAuth"]++
+			}
+			if guiCfg.InsecureAdminAccess {
+				guiStats["insecureAdminAccess"]++
+			}
+			if guiCfg.Debugging {
+				guiStats["debugging"]++
+			}
+			if guiCfg.InsecureSkipHostCheck {
+				guiStats["insecureSkipHostCheck"]++
+			}
+			if guiCfg.InsecureAllowFrameLoading {
+				guiStats["insecureAllowFrameLoading"]++
+			}
+
+			addr, err := net.ResolveTCPAddr("tcp", guiCfg.Address())
+			if err == nil {
+				if addr.IP.IsLoopback() {
+					guiStats["listenLocal"]++
+				} else if addr.IP.IsUnspecified() {
+					guiStats["listenUnspecified"]++
+				}
+			}
+
+			theme[guiCfg.Theme]++
+		}
+		guiStatsInterface := map[string]interface{}{
+			"theme": theme,
+		}
+		for key, value := range guiStats {
+			guiStatsInterface[key] = value
+		}
+		res["guiStats"] = guiStatsInterface
+	}
+
+	for key, value := range m.UsageReportingStats(version, preview) {
+		res[key] = value
+	}
+
 	return res
 }
 
 type usageReportingService struct {
-	cfg   *config.Wrapper
-	model *model.Model
-	stop  chan struct{}
+	cfg                config.Wrapper
+	model              model.Model
+	connectionsService connections.Service
+	forceRun           chan struct{}
+	stop               chan struct{}
+	stopped            chan struct{}
+	stopMut            sync.RWMutex
 }
 
-func newUsageReportingService(cfg *config.Wrapper, model *model.Model) *usageReportingService {
-	return &usageReportingService{
-		cfg:   cfg,
-		model: model,
-		stop:  make(chan struct{}),
+func newUsageReportingService(cfg config.Wrapper, model model.Model, connectionsService connections.Service) *usageReportingService {
+	svc := &usageReportingService{
+		cfg:                cfg,
+		model:              model,
+		connectionsService: connectionsService,
+		forceRun:           make(chan struct{}),
+		stop:               make(chan struct{}),
+		stopped:            make(chan struct{}),
 	}
+	close(svc.stopped) // Not yet running, dont block on Stop()
+	cfg.Subscribe(svc)
+	return svc
 }
 
 func (s *usageReportingService) sendUsageReport() error {
-	d := reportData(s.cfg, s.model)
+	d := reportData(s.cfg, s.model, s.connectionsService, s.cfg.Options().URAccepted, false)
 	var b bytes.Buffer
-	json.NewEncoder(&b).Encode(d)
+	if err := json.NewEncoder(&b).Encode(d); err != nil {
+		return err
+	}
 
 	client := &http.Client{
 		Transport: &http.Transport{
@@ -263,33 +367,66 @@ func (s *usageReportingService) sendUsageReport() error {
 }
 
 func (s *usageReportingService) Serve() {
+	s.stopMut.Lock()
 	s.stop = make(chan struct{})
-
-	l.Infoln("Starting usage reporting")
-	defer l.Infoln("Stopping usage reporting")
-
-	t := time.NewTimer(time.Duration(s.cfg.Options().URInitialDelayS) * time.Second) // time to initial report at start
+	s.stopped = make(chan struct{})
+	s.stopMut.Unlock()
+	t := time.NewTimer(time.Duration(s.cfg.Options().URInitialDelayS) * time.Second)
+	s.stopMut.RLock()
+	defer func() {
+		close(s.stopped)
+		s.stopMut.RUnlock()
+	}()
 	for {
 		select {
 		case <-s.stop:
 			return
+		case <-s.forceRun:
+			t.Reset(0)
 		case <-t.C:
-			err := s.sendUsageReport()
-			if err != nil {
-				l.Infoln("Usage report:", err)
+			if s.cfg.Options().URAccepted >= 2 {
+				err := s.sendUsageReport()
+				if err != nil {
+					l.Infoln("Usage report:", err)
+				} else {
+					l.Infof("Sent usage report (version %d)", s.cfg.Options().URAccepted)
+				}
 			}
 			t.Reset(24 * time.Hour) // next report tomorrow
 		}
 	}
 }
 
+func (s *usageReportingService) VerifyConfiguration(from, to config.Configuration) error {
+	return nil
+}
+
+func (s *usageReportingService) CommitConfiguration(from, to config.Configuration) bool {
+	if from.Options.URAccepted != to.Options.URAccepted || from.Options.URUniqueID != to.Options.URUniqueID || from.Options.URURL != to.Options.URURL {
+		s.stopMut.RLock()
+		select {
+		case s.forceRun <- struct{}{}:
+		case <-s.stop:
+		}
+		s.stopMut.RUnlock()
+	}
+	return true
+}
+
 func (s *usageReportingService) Stop() {
+	s.stopMut.RLock()
 	close(s.stop)
+	<-s.stopped
+	s.stopMut.RUnlock()
+}
+
+func (*usageReportingService) String() string {
+	return "usageReportingService"
 }
 
 // cpuBench returns CPU performance as a measure of single threaded SHA-256 MiB/s
 func cpuBench(iterations int, duration time.Duration, useWeakHash bool) float64 {
-	dataSize := 16 * protocol.BlockSize
+	dataSize := 16 * protocol.MinBlockSize
 	bs := make([]byte, dataSize)
 	rand.Reader.Read(bs)
 
@@ -310,7 +447,7 @@ func cpuBenchOnce(duration time.Duration, useWeakHash bool, bs []byte) float64 {
 	b := 0
 	for time.Since(t0) < duration {
 		r := bytes.NewReader(bs)
-		blocksResult, _ = scanner.Blocks(context.TODO(), r, protocol.BlockSize, int64(len(bs)), nil, useWeakHash)
+		blocksResult, _ = scanner.Blocks(context.TODO(), r, protocol.MinBlockSize, int64(len(bs)), nil, useWeakHash)
 		b += len(bs)
 	}
 	d := time.Since(t0)

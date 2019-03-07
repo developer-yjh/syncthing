@@ -24,7 +24,7 @@ func init() {
 }
 
 type tcpDialer struct {
-	cfg    *config.Wrapper
+	cfg    config.Wrapper
 	tlsCfg *tls.Config
 }
 
@@ -33,18 +33,17 @@ func (d *tcpDialer) Dial(id protocol.DeviceID, uri *url.URL) (internalConn, erro
 
 	conn, err := dialer.DialTimeout(uri.Scheme, uri.Host, 10*time.Second)
 	if err != nil {
-		l.Debugln(err)
 		return internalConn{}, err
 	}
 
 	err = dialer.SetTCPOptions(conn)
 	if err != nil {
-		l.Infoln(err)
+		l.Debugln("Dial (BEP/tcp): setting tcp options:", err)
 	}
 
 	err = dialer.SetTrafficClass(conn, d.cfg.Options().TrafficClass)
 	if err != nil {
-		l.Debugf("failed to set traffic class: %s", err)
+		l.Debugln("Dial (BEP/tcp): setting traffic class:", err)
 	}
 
 	tc := tls.Client(conn, d.tlsCfg)
@@ -63,7 +62,7 @@ func (d *tcpDialer) RedialFrequency() time.Duration {
 
 type tcpDialerFactory struct{}
 
-func (tcpDialerFactory) New(cfg *config.Wrapper, tlsCfg *tls.Config) genericDialer {
+func (tcpDialerFactory) New(cfg config.Wrapper, tlsCfg *tls.Config) genericDialer {
 	return &tcpDialer{
 		cfg:    cfg,
 		tlsCfg: tlsCfg,
@@ -74,8 +73,13 @@ func (tcpDialerFactory) Priority() int {
 	return tcpPriority
 }
 
-func (tcpDialerFactory) Enabled(cfg config.Configuration) bool {
-	return true
+func (tcpDialerFactory) AlwaysWAN() bool {
+	return false
+}
+
+func (tcpDialerFactory) Valid(_ config.Configuration) error {
+	// Always valid
+	return nil
 }
 
 func (tcpDialerFactory) String() string {
